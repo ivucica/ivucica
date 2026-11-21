@@ -20,6 +20,114 @@ I already have some (mostly) auto-generated repositories marked as private. They
 
 LLMs and "agentic" stuff can be timesavers, but holding them un-judiciously does have impact on both our craft and our hobby. I have played with LLMs and "agents" and "MCPs" enough that I have uses for them, but as far as publicly visible code goes, I want to try to keep the slop to a minimum. Not zero (it'll seep through, I suspect, and some prototypes might be fun to put out as-they-are at some point), but also curbing the enthusiasm seems like a responsible thing to do.
 
+### Mini update (Nov 2026)
+
+I've had some fun with local models: first `gemma-4-26b-a4b` and then `qwen3.8-27b` and then an abliterated version (just to see if it'll work out better). I've thrown some things at free tier Claude (not Claude Code, just Claude), and I've been getting some assistance from Google's AI Mode and Gemini (which, by virtue of paying for 2TB of storage, I have Plus variant of; not that I asked for it, but I have it). I've used GitHub Copilot in the past.
+
+At risk of sounding like an AI / LLM enthusiast (which I don't think I am, and I try to avoid becoming one), here's a few things I experienced to show why I still don't want to trust agentic activity without supervision, nor do I want to review incoming LLM-generated code.
+
+<details>
+
+<summary>Some details are here.</summary>
+
+#### Local model inside OpenCode
+
+Qwen is the only one that seems to be doing the job, especially with "skills" and "agents" (sigh) generously sprinkled to help with basics, some consistency in plan-keeping etc. (Even supervised, they need to be told to keep plans.) 
+
+When OpenCode fails me or the model due to bugs, the model has been told where to dig at the low level SQLite3 database to find things like "what is my internal session ID" or "because this is a canceled subagent, I can't see its `task_id` despite that it did 90% of the work already; here's how I find its session ID / `task_id`". Let's not dwell on security implications of letting a model touch harness's own API, config and database. It's horrible, so I do _not_ let it happen unsupervised.
+
+But when supervised, Qwen3.8 is almost able to do the job end-to-end. It loves going down the rabbit holes and abusing the generous context window (15k output, stable up to ~160k input, loadable up to ~260k).
+
+There's way too much approval and way too much reading of what this is doing. It's painful, but the only somewhat responsible thing to do.
+
+On the RTX 5090, processing inputs at 1500-2200 tokens a second in LM Studio takes its toll: when stopping to switch to another session / subagent, it can take from a few seconds up to ~2min of whirring at 100% CPU and 100% GPU. First world problems, but it adds up. It's blazing fast, but when the "system" "prompt" is bloated due to all the skills and agents and MCPs and base instructions and per-repo instructions exposed to the subagent, it adds up.
+
+Maintaining plans inside `AGENTS.md` is useful, but the context adds up.
+
+Qwen3.8-27b really, really overthinks and I did not manage to get it not to do so via LM Studio. 
+
+I'm not sure what to do with the single-homed OpenCode, though. Since my local Kubernetes cluster is not up yet in a way it can remain 24/7, I could not spin up something more persistent than this one giant database hosting all sessions and doing so on one machine in one homedir. It grew to over 5GB and, because Qwen (and Gemma-4 even) know how to query it, it is something I would prefer not to nuke: one session can learn from another in the same project (workspace), and even from another. It's somewhat unsettling to observe when remembering these are local models and totally happy tearing apart the OpenCode database to search for cues -- and the phrasing the sessions use would, were I prone to anthropomorphizing, make me say "it is aware of its own session when reading those SQLite entries". Unsettling!
+
+But it would be nice if OpenCode were on a PostgreSQL database so multiple processes of OC could ~concurrently read and write their own independent sessions from different machines. It does not need to be PostgreSQL, it could be anything as long as it is networked; unfortunately, it's SQLite and (from what I could gather) it cannot be easily swapped out for another DB layer.
+
+#### Local serving of LLMs
+
+I am pleasantly surprised that `llama.cpp` has been packaged for Debian trixie, so the thought occurred to have different models with hand-tweaked CLI arguments listening on different ports, and a small LLM proxy (preferably pre-made) sitting in front to provide the `/v1/models` endpoint listing available models, `/v1/chat/completions` in order to route the request to a currently idling instance of a model, and `/v1/embedding` as well (this one will be more important for API-agnostic and model-agnostic image embeddings).
+
+#### Trusting the models and harnesses
+
+Qwen3.8-27b is lacking in creativity and humor, and it does not speak or understand Croatian language well -- so I would not trust it for any translations. Gemma-4-26b-a4b worked reasonably ok for Croatian (at least for understanding), but for coding (agentic or otherwise) it creates typos and in the middle of code it'll happily go and type things in the middle of the sentence like `// wait, I made a typo!! best if I stop now`. Aside from overthinking and language difficulties, Qwen is simply more trustworthy.
+
+However, I am somewhat annoyed at myself for not setting up a different user account just for OpenCode to work, and then `chmod`ing and `chown`ing things it is supposed to be able to access accordingly. At that point using UNIX quotas would be useful too -- `~/.cache/go-build` regularly explodes to insane sizes. Luckily Qwen seems to have been trained in a way that lets it use `tmpfs`.
+
+Speaking of trust of models: I was amused at how deeply AI Studio's Gemini has lied in the UI about how much functionality it implemented vs faked; for many things, UI would claim "Live" or "Online" when it was presenting fake, hardcoded data. Qwen was the one to disentangle how much it lied. It's still not a superior model (overthinking, overly long execution, useful context window sizes are of the "really, really large" variety, etc).
+
+And security wise, it's not great that OpenCode does _not_ containerize the shell invocations. I don't mean full containers; but Linux namespaces (`unshare`) are not that complex. `bwrap` exists as well. One _could_ default to granting access only to homedir. One could use `ptrace` to intercept `open` calls that are reaching outside the workdir and a few allowlisted runtime dirs and base the approvals on that (including "user says never ask for access outside the dir"). Maybe other harnesses do it that way? But moving would mean getting rid of all sessions currently in progress for me.
+
+#### OpenCode
+
+What a strange piece of software!
+
+API and storage model is somewhat well thought out: there are concepts of "project" (workspace directory), session, message and message part. There are permissions with approvals. The loops work totally fine. Subagents are a great idea to get a smart model to launch another instance of itself with useful handoff information without actually wrapping up the parent session: great for "please think of steps; now launch subagents to execute these steps, and give each 20min to complete".
+
+But then the CLI is written in something that takes 20-30% of a Ryzen 7800x3d CPU core when rendering a spinner! For an unfathomable reason it's compiled with AVX2 or similar instruction set, meaning my old NAS with an ancient CPU cannot even launch the binary without going through QEMU, which means we're not talking just about the spinner causing it to die, but even typing becomes impossible. It's beautiful, and mouse works more like desktop interactions than terminal interactions (with downsides: it hijacks selection making you think it'll interact with clipboard, but then it does not; nor would I want it to). Copying from the text UI becomes difficult. But hey, at least I can click on a "Thinking..." UI element and it expands, or I can enter a subagent.
+
+Permissions approvals in CLI are done not on the subagent that spawned them: they are done in the root orchestrator view. Presumably the thought was "why would you look at what the subagent is doing and how it is doing it?", but I do look there. The only problem is you are most certain that the approvals UI will appear if you have the TUI open on that session. Sometimes, when you open it later, it won't show up. No clue how that could be happening.
+
+Web UI is a different beast: it might not show the approvals UI even if you are looking at it! And if you are on the phone and switch tabs or apps, you are playing with fire: it might never show up. There has been so many many sessions where I am staring idly wondering why the tool does not complete only to realize: some bug prevented the approvals UI from appearing at all inside subagent, in the orchestrator, or anywhere.
+
+Amusingly: permissions can be 'allow always' which really means (correctly) to 'allow until exit'. And it does grant permission by pattern matching: you would not know it by looking at web UI, but really, the long bash commands and pipelines are broken down by subcommands (`; `) and pipes (`|`). Grants typically go to `argv0 *`, but sometimes `argv0 -argv1 *`, and you cannot edit it. And web UI never shows this to you anyway: TUI shows this, web UI never breaks down what "always allow" means.
+
+And regarding subagents: it is unclear why they are treated _so very much_ like a special session. Are they a special session because they have a parent? Yes, they are. But perhaps I _should_ be able to pause that session and message it? There has been a million times where I wanted to interrupt the subagent (but not parent, back in the Gemma-4 days when concurrent requests would slow things down but not crash), and send a message to it. No such luck: I now have a workaround where the parent / orchestrator sends a message to subagent's `task_id` (sometimes having to find the session ID first, as described). But then I have to convince it not to waste its own context window's token count on overthinking how to phrase my request, and with Qwen that seems to be nearly impossible on the first try. It works out, but due to Qwen overthinking, it wastes a lot of compute.
+
+LSP integration is a nice, nice touch: when `read`ing a file, LSPs are activated and LSP tool invocations become available to models. This means when the model `edit`s a file in some way other than `bash`, they get diagnostics directly in their context, which is great.
+
+When the process restarts, sessions are not fully stored; 'agent' sessions abort rather than resume even if they're merely stuck inside an approval prompt or `question` tool. This is disappointing. I wish there were a pause button for everything and sessions resumed perfectly after a machine reboot (sans any `/tmp` scratch space, but better that than leaving the machine running just because I cannot suspend it). And imagine if I were running this on a Kubernetes pod; since pods cannot migrate and can only stop+start, what, am I supposed to only make OpenCode sessions migratable by spinning up Kubevirt and QEMU? I suppose at that point I can also explore hibernating the VM, but still.
+
+Now, I'm somewhat afraid of moving from OpenCode 1.18/1.19 to OpenCode 2.x. Too many changes. Does database model change a lot? Do I have to have Qwen rewrite the skills and agents that read the database for `todowrite` calls, or to find tool outputs, or similar? I'm afraid what I will find if I move to it. Or if I move out of OpenCode to something lighter.
+
+##### DCP plugin
+
+A thing that saves some conversations is DCP: dynamic context pruning, I believe. Great plugin. It encourages models to (at seemingly non-configurable time!) compress parts of the context after labeling each message with `m012` or similar. It throws away messages by marking them unreachable (so they're still in OpenCode database, just invisible to model) and inserts replacements (`b12` for example) containing "compressed" content. Very cool -- except Qwen wastes loads of time figuring out _what_ to compress. And it seemingly cannot _recompress_ things that became _less_ relevant as the session keeps going (sometimes it should just throw away most of the old conversations, and that's often necessary because old `b04` and similar blocks are completely unnecessary by that point).
+
+Is OpenCode's built-in compaction better? No clue. I don't feel like trying it too much.
+
+#### Embeddings
+
+For IRC, I tried getting some "type in vague query, get out chat messages" which would print out some context: the goal is to print out when a conversation on a topic was happening.
+
+Similarly, vision models can do image processing, but searching seems like it would be better with dedicated embeddings models.
+
+I have a little indexer that uses a vector database, but the results done based on cosine similarity are ... lacking. Especially because the actual conversations are IRC messages: is it worth it to include IRC nicknames in them, how does one do to pick surrounding context for a message, how does one weigh influence of one message vs 5 messages including the one indexed vs 50 messages, how does one pick a model that won't butcher Croatian chats?
+
+And it's text only right now, as I didn't get around to images yet (though I did find a model that's somewhat promising). So, this then yet remains to be figured out.
+
+#### Pricing
+
+I am looking at what Qwen is doing locally, or Gemma. I am looking at the token count for inputs and outputs. I am... somewhat afraid of how much it'd cost me to pay for API access. I bought the RTX 5090 a few years ago to play with image generation (I am no longer entertained with it, but it was fun for a while). I hope it doesn't die out on me. Electricity -- well, the 5090 is by itself spiking up to 575W, and adding the rest of the components, I think I'm hitting 700W on this machine when it's whirring away.
+
+I think this is ~0.30-0.50 per hour that this is maxed out. EUR12 a day if I were continuously running it at max (and I am not, though ongoing sessions make me keep the machine up; see above). But you know what I don't hit? Token limits. And privacy is reasonably preserved on both projects and data. It's an interesting tradeoff to have! Do I pay EUR20 for Gemini entry level pro plan, for Claude or for ChatGPT and keep running into token limits? Do I pay any of these EUR200 a month (!) to still hit limits, but hopefully get models that are more quick-witted at coming up with _correct_ solutions in fewer steps? And do I willingly submit all of the content they'd work on to The Cloud for "training and quality assurance purposes"? Some of my old opensource projects are already part of training data (I checked); do I make _everything_ I do (handcrafted or not) part of the training set, where someday it'll be the _mi scusi_ scene from the movie Eurotrip, someone apologizing for training data on things that were not supposed to be trained on?
+
+And those are not even really API plans, so I think I would be using just native harnesses or "apps", if at all.
+
+I don't know. Claude seems pretty mighty, to the extent I tried it on free plan. It's the closest contender for "I will throw some money at it to get the strangest things out of the way", but I'll likely be pulling my hair out already the first time that I hit a paywall similar to the one I am hitting on the free tier. Aside from Claude, Gemini is... interesting - but I don't think I want to pay even more than the Plus plan I accidentally got along with 2TB. ChatGPT does not interest me much; I have no indication it's good at coding, despite media and marketing trying to convince me it is. Maybe it is.
+
+Paying for things like access to web search (`exa` seems to work well) is also in consideration.
+
+In any case -- whom do I want to pay to gain `read` access to things I am playing with, learning on, or working on? Thankfully, right now I choose not to decide, and I'm just playing with local stuff.
+
+#### Happy?
+
+Eh, not quite. All I've learned is quite entertaining, and being able to sit back and let something else (under supervision) do the coding or investigation of the things I didn't want to do is fun.
+
+But I still don't want to review other people's generated things, and I don't want to use this for "serious" stuff. Nor do I want to let my machine run 24/7, which is the only reasonable way to get continuous assistance when needed.
+
+#### Keep going past Nov 2026?
+
+I have the few ongoing "projects", but the interest is waning. I sure hope to get back to regular coding, using the LLMs only for minor assistance.
+
+</details>
+
 ## Now for our regular programming: syntax demo spam
 
 > [!TIP]
